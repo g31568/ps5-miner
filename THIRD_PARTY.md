@@ -56,8 +56,9 @@ the packaged app as `licenses/Bitstream-Vera-LICENSE.txt`.
 | nlohmann/json v3.11.3 | MIT; `ps5/third-party/nlohmann/LICENSE.MIT` |
 | Nayuki QR generator v1.8.0 | MIT; full notice in both vendored source headers |
 | Bitstream Vera fonts and derived glyph data | Bitstream Vera redistribution terms; `homebrew/vendor/vera/LICENSE.txt` |
+| SDK linked libc helpers | GPL-3.0-or-later and individual BSD notices in `licenses/SDK-libc-NOTICES.txt` |
 | LLVM compiler builtins / libc++ / libc++abi / libunwind | Apache-2.0 WITH LLVM-exception and retained upstream notices; fetched via SDK build inputs |
-| zlib | zlib license, retained in fetched source and dependency notices |
+| zlib | zlib license; `licenses/zlib.txt` and fetched source |
 | Optional SQLite metadata helper | Public domain; not linked into the mining title |
 
 The root GPL text covers this project's combined work; it does not replace permissive component notices or claim authorship of upstream code. Preserve all original headers when modifying copied sources. The integration's build and adapter code differs from upstream and is identified by this repository's history and `patches/`.
