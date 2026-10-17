@@ -1,0 +1,34 @@
+{
+    "_comment": "Replace pool and wallet placeholders, then upload as /data/xmrig.json. One CPU thread, no background fork.",
+    "autosave": false,
+    "background": false,
+    "colors": false,
+    "log-file": "/data/xmrig.log",
+    "syslog": false,
+    "watch": false,
+    "randomx": {
+        "init": 1,
+        "mode": "light",
+        "rdmsr": false,
+        "wrmsr": false,
+        "numa": false
+    },
+    "cpu": {
+        "enabled": true,
+        "huge-pages": false,
+        "huge-pages-jit": false,
+        "hw-aes": false,
+        "asm": false,
+        "rx": [-1]
+    },
+    "pools": [
+        {
+            "algo": "rx/0",
+            "url": "YOUR_POOL_HOST:YOUR_POOL_PORT",
+            "user": "YOUR_MONERO_WALLET",
+            "pass": "ps5-test",
+            "tls": false,
+            "keepalive": true
+        }
+    ]
+}

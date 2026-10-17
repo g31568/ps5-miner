@@ -1,0 +1,13 @@
+# Generated dependencies, artifacts and private console evidence stay local.
+/build/
+/toolchain/
+/upstream/
+/logs/
+/dist/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*
+*.pem
+*.key

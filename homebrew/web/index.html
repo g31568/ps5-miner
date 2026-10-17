@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>XMR Miner — config.json</title><link rel="icon" type="image/png" href="/icon.png"><link rel="apple-touch-icon" href="/icon.png"><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<!-- Use the same app name as the PS5 launcher. -->
+<body><main><header><img class="mark" src="/icon.png" alt="XMR Miner logo" width="52" height="52"><div><h1>XMR Miner</h1><p>PS5 · Local configuration</p></div><span id="connection">Connecting…</span></header>
+<section class="stats" aria-label="Mining status"><div>XMRig<strong id="mining">—</strong></div><div>CPU pool<strong id="pool">—</strong></div><div>CPU RandomX<strong id="rate">— H/s</strong></div><div>HTTP API<strong id="http-api">—</strong></div></section>
+<!-- Independent CPU actions leave C29 mining and configuration untouched. -->
+<section aria-label="CPU mining"><h2>CPU · XMRig</h2><button id="cpu-start" type="button">Start XMRig</button> <button id="cpu-stop" type="button">Stop XMRig</button><p id="cpu-message" role="status"></p></section>
+<section aria-label="GPU mining"><h2>GPU · C29</h2><p id="gpu-status">Stopped · 0 graphs/s</p>
+<button id="gpu-start" type="button">Start GPU</button> <button id="gpu-stop" type="button">Stop GPU</button>
+<label for="gpu-editor">GPU pool configuration</label><textarea id="gpu-editor" spellcheck="false"></textarea>
+<p class="hint">Separate C29-capable pool connection. Stop GPU before saving. CPU mining continues. Rates use graphs/s.</p>
+<button id="gpu-reload" type="button">Reload GPU settings</button> <button id="gpu-save" type="button">Save GPU settings</button>
+<p id="gpu-message" role="status"></p></section>
+<section><div class="section-head"><div><h2>config.json</h2><p>Edit the saved configuration, then save to apply it.</p></div><button id="reload" type="button">Reload saved</button></div>
+<label for="user">Pool user</label><input id="user" maxlength="191" autocomplete="off" spellcheck="false">
+<label for="editor">Configuration JSON</label><textarea id="editor" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="help" disabled></textarea>
+<p id="help" class="hint">Threads: the number of <code>-1</code> entries in <code>cpu.rx</code> (1–16). Edit the pool URL, user, password, rig ID, keepalive, SOCKS5 proxy, HTTP API port, donation, print interval, or CPU yielding. Other native runtime settings are protected. The editor’s address stays available when the HTTP API is off.</p>
+<div class="actions"><span id="message" role="status" aria-live="polite">Loading configuration…</span><button id="save" type="button" disabled>Save &amp; apply</button></div></section>
+<details><summary>Mining log</summary><button id="log-refresh" type="button">Refresh log</button><pre id="log">Open to load the latest log.</pre></details><footer>Served by your PS5 on the local network. No cloud service.</footer></main></body></html>

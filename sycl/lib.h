@@ -1,0 +1,214 @@
+// Copyright GNU GPLv3 (c) 2023-2026 MoneroOcean <support@moneroocean.stream>
+
+#pragma once
+
+#include <cstdint>
+#include <map>
+#include <set>
+#include <string>
+
+// Windows needs explicit DLL visibility; everything else exports by default.
+#if defined(_WIN32) && defined(MOM_SYCL_BUILD)
+#define MOM_SYCL_API __declspec(dllexport)
+#elif defined(_WIN32)
+#define MOM_SYCL_API __declspec(dllimport)
+#else
+#define MOM_SYCL_API
+#endif
+
+MOM_SYCL_API std::map<std::string, std::string> algo_params(
+  unsigned max_cpu_batch, unsigned cpu_sockets, unsigned cpu_threads, unsigned cpu_l3cache,
+  const std::map<std::string, unsigned>& algo2mem,
+  const std::set<std::string>& cpu_algos,
+  const std::set<std::string>& gpu_cn_algos,
+  const std::set<std::string>& gpu_c29_algos,
+  const std::set<std::string>& gpu_kawpow_algos,
+  const std::set<std::string>& gpu_etchash_algos,
+  const std::set<std::string>& gpu_autolykos2_algos,
+  const std::set<std::string>& gpu_pearlhash_algos,
+  const std::set<std::string>& gpu_fishhash_algos,
+  const std::set<std::string>& gpu_karlsenhashv2_algos,
+  const std::set<std::string>& gpu_misc_algos,
+  const std::set<std::string>& gpu_verthash_algos,
+  const std::set<std::string>& gpu_zelhash_algos,
+  const std::set<std::string>& gpu_beamhash3_algos
+);
+
+MOM_SYCL_API void cn_gpu(
+  const uint8_t* inputs, unsigned input_size, uint8_t* output,
+  unsigned batch, const std::string& dev_str, const std::string& backend
+);
+
+MOM_SYCL_API int c29(
+  unsigned job_id, unsigned c29_proof_size,
+  const uint8_t* inputs, unsigned input_size, uint8_t* output,
+  uint32_t* output_edges, uint64_t* pnonce, const std::string& dev_str
+);
+
+MOM_SYCL_API int c30(
+  unsigned job_id, unsigned proof_size,
+  const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint32_t* output_edges, uint64_t* pnonce, const std::string& dev_str
+);
+
+MOM_SYCL_API int kawpow(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, uint64_t target,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// FiroPow / EvrProgPow: ProgPoW-0.9.4 variants of KawPoW. Same gpu_kawpow_hash_fun ABI; each bakes
+// its own epoch/period divisors + keccak seal (FiroPow: padding-constant seal; EvrProgPow: KawPoW
+// seal with the EVRMORE-PROGPOW magic).
+MOM_SYCL_API int firopow(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, uint64_t target,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+MOM_SYCL_API int evrprogpow(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, uint64_t target,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// MeowPow (Meowcoin): KawPoW variant with the classic-Ethereum DAG sizing but a shorter ProgPoW inner
+// loop (REGS 16, CNT_CACHE 6, CNT_MATH 9), period 6, and the "MEOWCOINMEOWPOW" keccak seal magic.
+MOM_SYCL_API int meowpow(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, uint64_t target,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+MOM_SYCL_API int etchash(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, const uint8_t* target, const uint8_t* seed_hash,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// Conflux Octopus: 32-byte problem hash plus an 8-byte nonce at offset 32.
+// SYCL-native acceleration retains the portable SYCL fallback on unsupported devices.
+MOM_SYCL_API int octopus(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, const uint8_t* target, const uint8_t* seed_hash,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+MOM_SYCL_API int autolykos2(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint64_t* pnonce, const uint8_t* target,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// FishHash is an Ethash-derived, BLAKE3-wrapped PoW with a fixed 4.6 GB DAG. Offline vectors use a
+// 40-byte header with a little-endian nonce at offset 32; live Iron Fish uses a 180-byte header with
+// big-endian randomness at offset 172. The target follows the corresponding layout; seed_hash is unused.
+MOM_SYCL_API int fishhash(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, const uint8_t* target, const uint8_t* seed_hash,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// KarlsenHashV2 (Karlsen KLS): FishHashPlus -- the FishHash 4.6 GB DAG with a folded index derivation
+// and plain-BLAKE3 wrapping. Same etchash ABI; 80-byte Kaspa blob with the 8-byte nonce at offset 72.
+MOM_SYCL_API int karlsenhashv2(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, const uint8_t* target, const uint8_t* seed_hash,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// Hoosat HooHash v1.1.0: accelerated FP64 search filter with canonical host verification.
+// Its 80-byte Kaspa-family header carries the little-endian nonce at offset 72.
+MOM_SYCL_API int hoohash(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, const uint8_t* target, const uint8_t* seed_hash,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// WagLayla WalaHash: BLAKE3/SHA3-256 HeavyHash with a per-header 64x64 nibble matrix.
+// Same 80-byte header and etchash ABI as the other small-blob variants.
+MOM_SYCL_API int walahash(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, const uint8_t* target, const uint8_t* seed_hash,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// XelisHashV3: 531-KiB scratchpad PoW over a 112-byte header; nonce is 8-byte big-endian at 40.
+// Shares the etchash ABI; mix_hash and seed_hash are unused.
+MOM_SYCL_API int xelishashv3(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, const uint8_t* target, const uint8_t* seed_hash,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// NexaPoW/Echelon: either a 40-byte header with an 8-byte nonce at offset 32, or a 48-byte header
+// with a fixed 8-byte extranonce followed by the 8-byte big-endian miner nonce.
+MOM_SYCL_API int nexapow(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, const uint8_t* target, const uint8_t* seed_hash,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// Verthash: fixed external 1.20-GiB dataset, 80-byte Bitcoin header, 4-byte nonce at offset 76.
+// Shares the etchash ABI; mix_hash and seed_hash are unused and pnonce's low 32 bits carry the nonce.
+MOM_SYCL_API int verthash(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint8_t* mix_hash, uint64_t* pnonce, const uint8_t* target, const uint8_t* seed_hash,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// ZHash / Equihash 144,5 (Bitcoin Gold): 140-byte Zcash-family header and 100-byte proof.
+// Uses the Equihash out-of-band solution ABI; pnonce points inside the header nonce field.
+MOM_SYCL_API int zhash(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size,
+  uint8_t* solution_out, uint64_t* pnonce, const uint8_t* target,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// Equihash 192,7 (Zclassic): 140-byte Zcash-family header and 400-byte proof.
+MOM_SYCL_API int equihash192_7(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size,
+  uint8_t* solution_out, uint64_t* pnonce, const uint8_t* target,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// Equihash 125,4 (ZelHash / Flux): Wagner bucket-collision solver (Tromp/djezo lineage). C29-like
+// ABI -- the 32-byte nonce lives in the 140-byte header (offset 108); the solver returns a solution
+// COUNT and writes the 52-byte compressed solution(s) out-of-band into solution_out. 256-bit big
+// target. is_test runs the M1 gen-kernel validation path (dumps the first entries' expanded rows).
+MOM_SYCL_API int zelhash(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* solution_out,
+  uint64_t* pnonce, const uint8_t* target,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// BeamHash III (Beam): Wagner k=5 bucket-collision solver. Same c29-like ABI as zelhash. Input
+// is the prework(32)||nonce(8)||extranonce(4) blob; the solver writes the 104-byte solution(s)
+// out-of-band into solution_out and returns the count. is_test runs the M1 gen-validation path.
+MOM_SYCL_API int beamhash3(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* solution_out,
+  uint64_t* pnonce, const uint8_t* target,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str
+);
+
+// pearlhash: input is the 76-byte incomplete header; pseed is the search seed (in/out, set to the
+// winning seed on a hit); intensity carries M and the explicit shape fields may select rectangular
+// M/N/K/rank profiles. On a hit returns 1 and the pool-ready base64 PlainProof is available from
+// pearlhash_claim(). Only the current certificate V3 salted noise-seed chain is supported.
+MOM_SYCL_API int pearlhash(
+  unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
+  uint64_t* pseed, const uint8_t* target,
+  unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str,
+  const std::string& backend, unsigned n, unsigned k, unsigned rank, unsigned cert_version
+);
+MOM_SYCL_API const char* pearlhash_claim(uint8_t jackpot[32], uint32_t* adjustment_factor);
+// Rank-128-equivalent GEMM MACs per PearlHash attempt: m*n*k*128/rank.  This is the
+// pool accounting unit, so different valid V3 ranks remain directly comparable.
+MOM_SYCL_API uint64_t pearlhash_attempt_hashes(
+  unsigned intensity, unsigned n, unsigned k, unsigned rank
+);
+
+// Release process-scoped SYCL state that requires ordered teardown while the Node environment and
+// compiler runtime are still alive. The addon registers this as an environment cleanup hook; it is
+// separate from C++ static destruction because runtime-compiled images have module destructors.
+MOM_SYCL_API void sycl_cleanup() noexcept;

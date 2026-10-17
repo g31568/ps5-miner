@@ -1,0 +1,46 @@
+name: Build PS5 miner
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+# Untrusted pull requests receive read-only permissions and no saved checkout token.
+permissions:
+  contents: read
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      LLVM_CONFIG: /usr/bin/llvm-config-18
+      PS5_DOCKER_CONTEXT: default
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-18 llvm-18 lld-18 cmake ninja-build glslc pkg-config libuv1-dev libssl-dev zlib1g-dev
+      - name: Fetch pinned CPU dependencies
+        run: bash scripts/setup.sh
+      - name: Test host boundaries
+        run: bash scripts/test-host.sh
+      - name: Build GPU dependencies
+        run: bash scripts/setup-gpu.sh
+      - name: Build and package title
+        run: python3 scripts/build-release.py --version "ci-${GITHUB_SHA::12}"
+      - name: Validate generated configuration and checksums
+        run: |
+          bash scripts/test-host.sh
+          cd "dist/ci-${GITHUB_SHA::12}"
+          sha256sum -c SHA256SUMS
+      - name: Upload app, source and checksums
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: PS5-XMR-Miner-${{ github.sha }}
+          path: dist/ci-*/
+          if-no-files-found: error
+          retention-days: 14

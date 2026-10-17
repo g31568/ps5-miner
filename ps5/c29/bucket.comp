@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "siphash.glsl"
+layout(local_size_x_id = 1) in;
+layout(constant_id = 2) const uint bucketLayout = 0;
+layout(constant_id = 3) const bool batchOutput = false;
+layout(constant_id = 4) const uint seedMode = 2;
+layout(constant_id = 5) const uint staggerStep = 32;
+// Optional tagged reservations affect only the expensive first trim.
+layout(constant_id = 6) const uint outputCache = 0;
+layout(constant_id = 0) const uint operation = 0;
+layout(binding=0,std430) buffer A { uvec2 edges[]; } a1;
+layout(binding=1,std430) buffer A2 { uvec2 edges[]; } a2;
+layout(binding=2,std430) buffer B { uvec2 edges[]; } b;
+layout(binding=3,std430) buffer M { uint words[]; } m;
+layout(push_constant,std430) uniform P {
+  uvec2 seed[4];
+  uint edgeCount, nodeMask, bucketBits, seedCap, mainCap, split, source, tailCap;
+} p;
+// Each bucket owns the high node bits, keeping both degree planes in 32 KiB LDS.
+shared uint degree[8192];
+const uint overflow=8192, tailCount=8193, tailBase=8208;
+uint buckets() { return 1u << p.bucketBits; }
+uint sourceKind() { return p.source & 3u; }
+// Permutation changes physical bucket order while preserving each vertex partition.
+uint bucketFor(uint node) {
+  uint bucket=node&(buckets()-1);
+  return (bucketLayout&2u)!=0 && p.bucketBits==12 ? ((bucket&63u)<<6)|(bucket>>6) : bucket;
+}
+uint outputOffset(uint bucket, bool seed) {
+  // Bit 2 pads regular buckets so the first trim can also stagger without losing capacity.
+  return !seed && (bucketLayout&1u)!=0 && (sourceKind()!=0 || (bucketLayout&4u)!=0)
+    ? (bucket&255u)*staggerStep : 0u;
+}
+uint srcBase() { return sourceKind() == 2 ? 4096 : 0; }
+uvec2 readEdge(uint bucket, uint slot) {
+  uint offset=(p.source&4u)!=0 ? (bucket&255u)*staggerStep : 0u;
+  if(sourceKind()==2) return b.edges[bucket*p.mainCap+offset+slot];
+  if(sourceKind()==1) return a1.edges[bucket*p.mainCap+offset+slot];
+  return bucket<p.split ? a1.edges[bucket*p.seedCap+slot] : a2.edges[(bucket-p.split)*p.seedCap+slot];
+}
+void writeEdge(uvec2 edge, bool seed, uint bucket, uint slot) {
+  uint cap=seed ? p.seedCap : p.mainCap;
+  uint offset=outputOffset(bucket,seed);
+  if(slot>=cap-offset) { atomicOr(m.words[overflow],1); return; }
+  if(seed) {
+    if(bucket<p.split) a1.edges[bucket*cap+slot]=edge;
+    else a2.edges[(bucket-p.split)*cap+slot]=edge;
+  } else if(sourceKind()==2) a1.edges[bucket*cap+offset+slot]=edge;
+  else b.edges[bucket*cap+offset+slot]=edge;
+}
+void storeEdge(uvec2 edge, bool seed) {
+  uint bucket=bucketFor(edge.x);
+  uint slot=atomicAdd(m.words[seed || sourceKind()==2 ? bucket : 4096+bucket],1);
+  writeEdge(edge,seed,bucket,slot);
+}
+uint hashEdge(uvec2 edge) { return ((edge.x*0x9e3779b9u) ^ (edge.y*0x85ebca6bu)) & 8191u; }
+// Circular tiles retain remainders in place; all accesses wrap at the same bounded capacity.
+uint seedSlot(uint bin,uint slot) {
+  uint pos=slot+(seedMode==3 ? degree[7360+bin] : 0u);
+  return bin*56+(pos>=56 ? pos-56 : pos);
+}
+// Four adjacent lanes copy one reserved bin; specialization keeps the selected path loop-free.
+void copySeedBin(uint lane,uint bin,uint bins,bool coarse,uint parent) {
+  for(uint pos=lane&3u;pos<degree[7296+bin];pos+=4) {
+    uint i=seedSlot(bin,pos);
+    uvec2 edge=uvec2(degree[i*2],degree[i*2+1]);
+    uint slot=degree[7232+bin]+pos;
+    if(coarse) {
+      uint cap=p.seedCap<<(p.bucketBits-min(p.bucketBits,6u));
+      if(slot>=cap) atomicOr(m.words[overflow],4);
+      else if(bin<bins/2) b.edges[bin*cap+slot]=edge;
+      else a1.edges[(bin-bins/2)*cap+slot]=edge;
+    } else writeEdge(edge,true,(parent<<(p.bucketBits-min(p.bucketBits,6u)))+bin,slot);
+  }
+}
+// Flush eight-edge tiles with one global reservation and contiguous endpoint writes.
+void flushSeed(uint lane,uint bins,bool finalFlush,bool coarse,uint parent) {
+  if(lane<bins) {
+    uint n=min(degree[7168+lane],56u), take=finalFlush ? n : (n&~7u);
+    degree[7296+lane]=take;
+    uint dst=coarse ? lane : (parent<<(p.bucketBits-min(p.bucketBits,6u)))+lane;
+    degree[7232+lane]=take==0 ? 0 : atomicAdd(m.words[coarse ? dst : 4096+dst],take);
+  }
+  barrier();
+  uint bin=lane/4;
+  if(bin<bins) copySeedBin(lane,bin,bins,coarse,parent);
+  // At 128 threads the second half of bins shares the same lanes before the read fence.
+  if(gl_WorkGroupSize.x==128 && bin+32<bins) copySeedBin(lane,bin+32,bins,coarse,parent);
+  barrier();
+  if(lane<bins) {
+    uint n=min(degree[7168+lane],56u), take=degree[7296+lane];
+    if(seedMode==3) {
+      uint head=degree[7360+lane]+take;
+      degree[7360+lane]=head>=56 ? head-56 : head;
+    } else for(uint i=take;i<n;i++) {
+      degree[(lane*56+i-take)*2]=degree[(lane*56+i)*2];
+      degree[(lane*56+i-take)*2+1]=degree[(lane*56+i)*2+1];
+    }
+    degree[7168+lane]=n-take;
+  }
+  barrier();
+}
+void stageSeed(uvec2 edge,uint bin) {
+  uint slot=atomicAdd(degree[7168+bin],1);
+  // A pathological tile is rejected rather than overwriting shared endpoint storage.
+  if(slot>=56) atomicOr(m.words[overflow],4);
+  else {uint i=seedSlot(bin,slot);degree[i*2]=edge.x;degree[i*2+1]=edge.y;}
+}
+void main() {
+  uint lane=gl_LocalInvocationID.x, bucket=gl_WorkGroupID.x;
+  if(operation==1) {
+    uint plane=max(1u,((p.nodeMask+1)>>p.bucketBits)/32);
+    for(uint i=lane;i<plane*2;i+=gl_WorkGroupSize.x) degree[i]=0;
+    barrier();
+    // Overflowed staggered buckets must remain in bounds until the host rejects the graph.
+    uint cap=sourceKind()==0 ? p.seedCap : p.mainCap-((p.source&4u)!=0 ? (bucket&255u)*staggerStep : 0u);
+    uint count=min(m.words[srcBase()+bucket],cap);
+    for(uint i=lane;i<count;i+=gl_WorkGroupSize.x) {
+      uint node=readEdge(bucket,i).x>>p.bucketBits, mask=1u<<(node&31);
+      if((atomicOr(degree[node/32],mask)&mask)!=0) atomicOr(degree[plane+node/32],mask);
+    }
+    barrier();
+    if((batchOutput && (p.source&8u)!=0) ||
+       (outputCache!=0 && sourceKind()==0 && (p.source&16u)==0)) {
+      // Retain degree predicates privately, then reuse the same 32 KiB for counts and offsets.
+      uint kept[18];
+      for(uint i=0;i<18;i++) kept[i]=0;
+      for(uint i=lane;i<count;i+=gl_WorkGroupSize.x) {
+        uvec2 edge=readEdge(bucket,i); uint node=edge.x>>p.bucketBits;
+        if((degree[plane+node/32]&(1u<<(node&31)))!=0) {
+          uint iteration=i/gl_WorkGroupSize.x;
+          kept[iteration/32]|=1u<<(iteration&31);
+        }
+      }
+      barrier();
+      if(outputCache!=0 && sourceKind()==0 && (p.source&16u)==0) {
+        // Direct-mapped tags combine matching destinations; collisions retain direct writes.
+        // Scale tiny differential graphs too, so they exercise conflicting tags.
+        uint slots=max(1u,buckets()/(outputCache==1 ? 4u : 2u));
+        for(uint i=lane;i<slots;i+=gl_WorkGroupSize.x) {
+          degree[i]=0xffffffffu;degree[slots+i]=0;
+        }
+        barrier();
+        for(uint i=lane;i<count;i+=gl_WorkGroupSize.x) {
+          uint iteration=i/gl_WorkGroupSize.x;
+          if((kept[iteration/32]&(1u<<(iteration&31)))!=0) {
+            uint dst=bucketFor(readEdge(bucket,i).y), tag=dst&(slots-1u);
+            uint old=atomicCompSwap(degree[tag],0xffffffffu,dst);
+            if(old==0xffffffffu || old==dst) atomicAdd(degree[slots+tag],1);
+          }
+        }
+        barrier();
+        for(uint tag=lane;tag<slots;tag+=gl_WorkGroupSize.x) {
+          uint n=degree[slots+tag], dst=degree[tag];
+          degree[2u*slots+tag]=n==0 ? 0 : atomicAdd(m.words[4096+dst],n);
+        }
+        barrier();
+        for(uint i=lane;i<count;i+=gl_WorkGroupSize.x) {
+          uint iteration=i/gl_WorkGroupSize.x;
+          if((kept[iteration/32]&(1u<<(iteration&31)))!=0) {
+            uvec2 edge=readEdge(bucket,i).yx;
+            uint dst=bucketFor(edge.x), tag=dst&(slots-1u);
+            if(degree[tag]==dst) writeEdge(edge,false,dst,atomicAdd(degree[2u*slots+tag],1));
+            else storeEdge(edge,false);
+          }
+        }
+        return;
+      }
+      for(uint i=lane;i<8192;i+=gl_WorkGroupSize.x) degree[i]=0;
+      barrier();
+      for(uint i=lane;i<count;i+=gl_WorkGroupSize.x) {
+        uint iteration=i/gl_WorkGroupSize.x;
+        if((kept[iteration/32]&(1u<<(iteration&31)))!=0)
+          atomicAdd(degree[bucketFor(readEdge(bucket,i).y)],1);
+      }
+      barrier();
+      for(uint dst=lane;dst<buckets();dst+=gl_WorkGroupSize.x) {
+        uint n=degree[dst];
+        degree[4096+dst]=n==0 ? 0 : atomicAdd(m.words[sourceKind()==2 ? dst : 4096+dst],n);
+      }
+      barrier();
+      for(uint i=lane;i<count;i+=gl_WorkGroupSize.x) {
+        uint iteration=i/gl_WorkGroupSize.x;
+        if((kept[iteration/32]&(1u<<(iteration&31)))!=0) {
+          uvec2 edge=readEdge(bucket,i).yx; uint dst=bucketFor(edge.x);
+          uint slot=atomicAdd(degree[4096+dst],1);
+          writeEdge(edge,false,dst,slot);
+        }
+      }
+      return;
+    }
+    // A diagnostic-only branch retains degree work but replaces global rebucketing with checksums.
+    uint checksum=0;
+    for(uint i=lane;i<count;i+=gl_WorkGroupSize.x) {
+      uvec2 edge=readEdge(bucket,i); uint node=edge.x>>p.bucketBits;
+      if((degree[plane+node/32]&(1u<<(node&31)))!=0) {
+        if((p.source&16u)!=0) checksum^=edge.x+(edge.y*0x9e3779b9u);
+        else storeEdge(edge.yx,false);
+      }
+    }
+    if((p.source&16u)!=0) atomicXor(m.words[tailBase+bucket*256+(lane&255u)],checksum);
+    return;
+  }
+  if(operation==2) {
+    // Overflowed staggered buckets must remain in bounds until the host rejects the graph.
+    uint cap=sourceKind()==0 ? p.seedCap : p.mainCap-((p.source&4u)!=0 ? (bucket&255u)*staggerStep : 0u);
+    uint count=min(m.words[srcBase()+bucket],cap);
+    for(uint i=lane;i<count;i+=gl_WorkGroupSize.x) {
+      uint slot=atomicAdd(m.words[tailCount],1);
+      if(slot>=p.tailCap) { atomicOr(m.words[overflow],2); continue; }
+      uvec2 edge=readEdge(bucket,i);
+      m.words[tailBase+slot*2]=edge.x; m.words[tailBase+slot*2+1]=edge.y;
+    }
+    return;
+  }
+  if(operation==4) {
+    uint coarseCount=1u<<min(p.bucketBits,6u), parent=p.source+bucket/32;
+    uint fineBits=p.bucketBits-min(p.bucketBits,6u), bins=1u<<fineBits, cap=p.seedCap*bins;
+    uint count=min(m.words[parent],cap), micro=bucket&31u;
+    uint span=(cap+31u)/32u, start=micro*span, end=min(count,start+span);
+    if(bins==1) {
+      // Tiny oracle graphs already have one final bucket per coarse bucket.
+      uint n=end>start ? end-start : 0;
+      if(lane==0) degree[0]=n==0 ? 0 : atomicAdd(m.words[4096+parent],n);
+      barrier();
+      for(uint i=start+lane;i<end;i+=gl_WorkGroupSize.x) {
+        uvec2 edge=parent<coarseCount/2 ? b.edges[parent*cap+i] : a1.edges[(parent-coarseCount/2)*cap+i];
+        writeEdge(edge,true,parent,degree[0]+i-start);
+      }
+      return;
+    }
+    if(lane<bins) {degree[7168+lane]=0;degree[7360+lane]=0;}
+    barrier();
+    // Upper coarse buckets move first into the disjoint upper destination region.
+    for(uint base=start;base<end;base+=gl_WorkGroupSize.x) {
+      uint i=base+lane;
+      if(i<end) {
+        uvec2 edge=parent<coarseCount/2 ? b.edges[parent*cap+i] : a1.edges[(parent-coarseCount/2)*cap+i];
+        stageSeed(edge,bucketFor(edge.x)&(bins-1));
+      }
+      barrier();flushSeed(lane,bins,false,false,parent);
+    }
+    flushSeed(lane,bins,true,false,parent);
+    return;
+  }
+  // Generate each stateful 64-nonce block once; only candidate graphs repeat for recovery.
+  uint block=gl_GlobalInvocationID.y*gl_NumWorkGroups.x*gl_WorkGroupSize.x+gl_GlobalInvocationID.x;
+  bool valid=block<(p.edgeCount+63)/64;
+  // Partial final workgroups still participate in every seed-buffer barrier.
+  if(!valid && !(operation==0 && seedMode!=0 && p.source!=3)) return;
+  uvec2 aa=p.seed[0],bb=p.seed[1],cc=p.seed[2],dd=p.seed[3], hashes[64];
+  for(uint i=0;i<64 && valid;i++) {
+    uvec2 nonce=uvec2(block*64+i,0); dd^=nonce;
+    sipRound(aa,bb,cc,dd); sipRound(aa,bb,cc,dd); aa^=nonce; cc^=uvec2(255,0);
+    sipRound(aa,bb,cc,dd); sipRound(aa,bb,cc,dd); sipRound(aa,bb,cc,dd); sipRound(aa,bb,cc,dd);
+    hashes[i]=aa^bb^cc^dd;
+  }
+  bool buffered=operation==0 && seedMode==1 && p.source!=3;
+  if(operation==0 && seedMode>=2 && p.source!=3) {
+    uint bins=1u<<min(p.bucketBits,6u), fineBits=p.bucketBits-min(p.bucketBits,6u);
+    if(lane<bins) {degree[7168+lane]=0;degree[7360+lane]=0;}
+    barrier();
+    for(uint i=0;i<64;i++) {
+      if(valid && block*64+i<p.edgeCount) {
+        uvec2 edge=(i==63 ? hashes[63] : hashes[i]^hashes[63])&p.nodeMask;
+        stageSeed(edge,bucketFor(edge.x)>>fineBits);
+      }
+      // Mode 3 stages two iterations before flushing, halving steady-state workgroup barriers.
+      if(seedMode!=3 || (i&1u)!=0) {barrier();flushSeed(lane,bins,false,true,0);}
+    }
+    flushSeed(lane,bins,true,true,0);
+    return;
+  }
+  if(buffered) {
+    // Reserve one contiguous output range per destination for the whole 64-edge lane block.
+    for(uint dst=lane;dst<buckets();dst+=gl_WorkGroupSize.x) degree[dst]=0;
+    barrier();
+    for(uint i=0;i<64 && valid && block*64+i<p.edgeCount;i++) {
+      uvec2 edge=(i==63 ? hashes[63] : hashes[i]^hashes[63]) & p.nodeMask;
+      atomicAdd(degree[bucketFor(edge.x)],1);
+    }
+    barrier();
+    for(uint dst=lane;dst<buckets();dst+=gl_WorkGroupSize.x) {
+      uint n=degree[dst];
+      degree[4096+dst]=n==0 ? 0 : atomicAdd(m.words[dst],n);
+    }
+    barrier();
+  }
+  uint checksum=0;
+  for(uint i=0;i<64 && valid && block*64+i<p.edgeCount;i++) {
+    uvec2 edge=(i==63 ? hashes[63] : hashes[i]^hashes[63]) & p.nodeMask;
+    // Hash-only diagnostics use the same pipeline and consume every generated endpoint.
+    if(operation==0) {
+      if(p.source==3) checksum=(checksum<<1 | checksum>>31)^edge.x^(edge.y*0x9e3779b9u);
+      else if(buffered) {
+        uint dst=bucketFor(edge.x),slot=atomicAdd(degree[4096+dst],1);
+        writeEdge(edge,true,dst,slot);
+      } else storeEdge(edge,true);
+    }
+    else {
+      uint base=tailBase+2*p.tailCap, slot=hashEdge(edge);
+      for(uint probe=0;probe<8192;probe++,slot=(slot+1)&8191) {
+        uint offset=base+slot*3;
+        if(m.words[offset+2]==0xffffffffu) break;
+        if(m.words[offset]==edge.x && m.words[offset+1]==edge.y) {
+          atomicMin(m.words[base+8192*3+slot],block*64+i); break;
+        }
+      }
+    }
+  }
+  if(operation==0 && p.source==3) atomicXor(m.words[tailBase+(block&8191u)],checksum);
+}

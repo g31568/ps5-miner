@@ -1,0 +1,125 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "siphash.glsl"
+layout(local_size_x = 64) in;
+// Specialization removes SipHash's private array from the cached pipeline's register allocation.
+layout(constant_id = 0) const bool cachedPipeline = false;
+layout(set = 0, binding = 0, std430) buffer State { uint words[]; } state;
+layout(set = 0, binding = 1, std430) buffer Cache { uint words[]; } cache;
+layout(set = 0, binding = 2, std430) buffer NextCache { uint words[]; } nextCache;
+shared uint liveMask[2];
+shared uint compactBase;
+layout(push_constant, std430) uniform Parameters {
+  uvec2 seed[4];
+  uint firstNonce;
+  uint edgeCount;
+  uint nodeMask;
+  uint phase; // Even phases count; odd phases prune. Alternate U and V each round.
+} params;
+
+// One invocation owns a 64-edge block and both corresponding alive words.
+void main() {
+  // Cached survivors retain original nonces; pruning atomically updates shared alive words.
+  uint index = gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64 + gl_GlobalInvocationID.x;
+  uint blocks = (params.edgeCount + 63) / 64;
+  if (cachedPipeline && (params.phase & 0x20000000u) != 0) {
+    // One reservation per workgroup compacts live records without a contended per-edge counter.
+    uint lane = gl_LocalInvocationID.x;
+    if (lane < 2) liveMask[lane] = 0;
+    barrier();
+    uint entry = blocks + 1 + index * 3;
+    uint nonce = index < cache.words[blocks] ? cache.words[entry] : 0xffffffffu;
+    if (nonce != 0xffffffffu) atomicOr(liveMask[lane / 32], 1u << (lane & 31));
+    barrier();
+    if (lane == 0) {
+      uint count = bitCount(liveMask[0]) + bitCount(liveMask[1]);
+      compactBase = count == 0 ? 0 : atomicAdd(nextCache.words[blocks], count);
+    }
+    barrier();
+    if (nonce != 0xffffffffu) {
+      uint rank = bitCount(liveMask[lane / 32] & ((1u << (lane & 31)) - 1u));
+      if (lane >= 32) rank += bitCount(liveMask[0]);
+      uint outputEntry = blocks + 1 + (compactBase + rank) * 3;
+      nextCache.words[outputEntry] = nonce;
+      nextCache.words[outputEntry + 1] = cache.words[entry + 1];
+      nextCache.words[outputEntry + 2] = cache.words[entry + 2];
+    }
+    return;
+  }
+  if (cachedPipeline) {
+    if (index >= cache.words[blocks]) return;
+    uint entry = blocks + 1 + index * 3;
+    uint nonce = cache.words[entry];
+    // Each cache entry has one owner; a tombstone avoids future bitmap reads and atomic clears.
+    if (nonce == 0xffffffffu) return;
+    uint bit = 1u << (nonce & 31);
+    uint aliveWords = (params.edgeCount + 31) / 32;
+    uint degreeWords = (params.nodeMask + 1) / 32;
+    uint seenStart = 16 + aliveWords + 16;
+    uint twiceStart = seenStart + degreeWords + 16;
+    uint side = ((params.phase & 0xffffu) / 2) & 1;
+    uint node = cache.words[entry + 1 + side];
+    uint word = node >> 5, mask = 1u << (node & 31);
+    if ((params.phase & 1) == 0) {
+      if ((atomicOr(state.words[seenStart + word], mask) & mask) != 0)
+        atomicOr(state.words[twiceStart + word], mask);
+    } else if ((state.words[twiceStart + word] & mask) == 0) {
+      atomicAnd(state.words[16 + nonce / 32], ~bit);
+      cache.words[entry] = 0xffffffffu;
+    }
+    return;
+  }
+  // Two dimensions cover all 2^23 C29 blocks without exceeding 65,535 groups per axis.
+  uint block = gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64 + gl_GlobalInvocationID.x;
+  if (block >= (params.edgeCount + 63) / 64) return;
+  uint aliveWords = (params.edgeCount + 31) / 32;
+  uint degreeWords = (params.nodeMask + 1) / 32;
+  uint aliveStart = 16;
+  uint seenStart = aliveStart + aliveWords + 16;
+  uint twiceStart = seenStart + degreeWords + 16;
+  uvec2 live = uvec2(state.words[aliveStart + block * 2], 0);
+  if (block * 2 + 1 < aliveWords) live.y = state.words[aliveStart + block * 2 + 1];
+  if ((live.x | live.y) == 0) return;
+  uvec2 a = params.seed[0], b = params.seed[1];
+  uvec2 c = params.seed[2], d = params.seed[3];
+  uvec2 hashes[64];
+  for (uint i = 0; i < 64; ++i) {
+    uvec2 nonce = uvec2(params.firstNonce + block * 64 + i, 0);
+    d ^= nonce;
+    sipRound(a, b, c, d); sipRound(a, b, c, d);
+    a ^= nonce;
+    c ^= uvec2(255, 0);
+    sipRound(a, b, c, d); sipRound(a, b, c, d);
+    sipRound(a, b, c, d); sipRound(a, b, c, d);
+    hashes[i] = a ^ b ^ c ^ d;
+  }
+  uint side = ((params.phase & 0xffffu) / 2) & 1;
+  uint slot = (params.phase & 0x80000000u) != 0 ? cache.words[block] : 0;
+  for (uint i = 0; i < 64; ++i) {
+    uint laneWord = i / 32, bit = 1u << (i & 31);
+    if (block * 64 + i >= params.edgeCount || (live[laneWord] & bit) == 0) continue;
+    uvec2 edge = i == 63 ? hashes[63] : hashes[i] ^ hashes[63];
+    if ((params.phase & 0x80000000u) != 0) {
+      // Build the endpoint cache once, using disjoint CPU-prefix-assigned ranges.
+      uint entry = blocks + 1 + slot++ * 3;
+      cache.words[entry] = block * 64 + i;
+      cache.words[entry + 1] = edge.x & params.nodeMask;
+      cache.words[entry + 2] = edge.y & params.nodeMask;
+      continue;
+    }
+    uint node = edge[side] & params.nodeMask;
+    uint word = node >> 5, mask = 1u << (node & 31);
+    if ((params.phase & 1) == 0) {
+      // Two atomic bit planes saturate each degree at two without lost increments.
+      if ((atomicOr(state.words[seenStart + word], mask) & mask) != 0)
+        atomicOr(state.words[twiceStart + word], mask);
+    } else if ((state.words[twiceStart + word] & mask) == 0) {
+      live[laneWord] &= ~bit;
+    }
+  }
+  if ((params.phase & 1) != 0) {
+    state.words[aliveStart + block * 2] = live.x;
+    if (block * 2 + 1 < aliveWords) state.words[aliveStart + block * 2 + 1] = live.y;
+  }
+}

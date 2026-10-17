@@ -1,0 +1,148 @@
+// Copyright GNU GPLv3 (c) 2026 MoneroOcean <support@moneroocean.stream>
+
+#pragma once
+
+#include "amd-features.h"
+
+#include <hip/hip_runtime_api.h>
+#include <hip/hiprtc.h>
+#include <sycl/sycl.hpp>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+#include <exception>
+#include <string>
+
+namespace mom {
+
+// Resolve the queue's actual native device/stream and propagate any submitted interop failure.
+inline void hip_queue_identity(sycl::queue& queue, hipDevice_t& device, hipStream_t& stream) {
+  hipError_t status = hipErrorUnknown;
+  hipDevice_t candidate_device = -1;
+  hipStream_t candidate_stream = nullptr;
+  // Submitted interop and native identity faults are not optional-backend unavailability.
+  sycl::event event = queue.AdaptiveCpp_enqueue_custom_operation(
+      [&](sycl::interop_handle& handle) {
+        candidate_stream = handle.get_native_queue<sycl::backend::hip>();
+        status = hipStreamGetDevice(candidate_stream, &candidate_device);
+      });
+  event.wait_and_throw();
+  if (status != hipSuccess)
+    throw std::string("hipStreamGetDevice: ") + hipGetErrorString(status);
+  device = candidate_device;
+  stream = candidate_stream;
+}
+
+inline void hip_queue_device(sycl::queue& queue, hipDevice_t& device) {
+  hipStream_t stream = nullptr;
+  hip_queue_identity(queue, device, stream);
+}
+
+// HIPRTC is optional at runtime. Keeping its entry points behind one dynamic loader lets each
+// source-JIT algorithm retain its portable SYCL fallback when the compiler library is unavailable.
+class HiprtcApi {
+#if defined(_WIN32)
+  HMODULE library_ = nullptr;
+#else
+  void* library_ = nullptr;
+#endif
+
+  template <typename T>
+  bool load_symbol(T& output, const char* const name) {
+#if defined(_WIN32)
+    output = reinterpret_cast<T>(GetProcAddress(library_, name));
+#else
+    output = reinterpret_cast<T>(dlsym(library_, name));
+#endif
+    if (output)
+      return true;
+    error = std::string("missing HIPRTC symbol ") + name;
+    return false;
+  }
+
+  // Probe supported library names once; incomplete installations stay unavailable to all callers.
+  HiprtcApi() {
+#if defined(_WIN32)
+    const char* const names[] = {"hiprtc.dll",     "hiprtc0701.dll", "hiprtc0700.dll",
+                                 "hiprtc0604.dll", "hiprtc0603.dll", "hiprtc0507.dll"};
+    for (const char* const name : names)
+      if ((library_ = LoadLibraryA(name)))
+        break;
+#else
+    const char* const names[] = {"libhiprtc.so", "libhiprtc.so.7", "libhiprtc.so.6"};
+    for (const char* const name : names)
+      if ((library_ = dlopen(name, RTLD_NOW | RTLD_LOCAL)))
+        break;
+#endif
+    if (!library_) {
+      error = "HIPRTC library is not installed";
+      return;
+    }
+    (void)(load_symbol(create_program, "hiprtcCreateProgram") &&
+           load_symbol(compile_program, "hiprtcCompileProgram") &&
+           load_symbol(get_log_size, "hiprtcGetProgramLogSize") &&
+           load_symbol(get_log, "hiprtcGetProgramLog") &&
+           load_symbol(get_code_size, "hiprtcGetCodeSize") &&
+           load_symbol(get_code, "hiprtcGetCode") &&
+           load_symbol(destroy_program, "hiprtcDestroyProgram") &&
+           load_symbol(error_string, "hiprtcGetErrorString"));
+  }
+
+public:
+  HiprtcApi(const HiprtcApi&) = delete;
+  HiprtcApi& operator=(const HiprtcApi&) = delete;
+
+  decltype(&hiprtcCreateProgram) create_program = nullptr;
+  decltype(&hiprtcCompileProgram) compile_program = nullptr;
+  decltype(&hiprtcGetProgramLogSize) get_log_size = nullptr;
+  decltype(&hiprtcGetProgramLog) get_log = nullptr;
+  decltype(&hiprtcGetCodeSize) get_code_size = nullptr;
+  decltype(&hiprtcGetCode) get_code = nullptr;
+  decltype(&hiprtcDestroyProgram) destroy_program = nullptr;
+  decltype(&hiprtcGetErrorString) error_string = nullptr;
+  std::string error;
+
+  bool available() const {
+    return library_ && create_program && compile_program && get_log_size && get_log &&
+           get_code_size && get_code && destroy_program && error_string;
+  }
+
+  static HiprtcApi& instance() {
+    static HiprtcApi api;
+    return api;
+  }
+};
+
+// Own only the temporary compiler program; release it before loading the resulting module.
+class HiprtcProgram {
+  HiprtcApi& api_;
+  hiprtcProgram program_ = nullptr;
+
+public:
+  // Construct after available() validates the compiler entry points.
+  explicit HiprtcProgram(HiprtcApi& api) noexcept : api_(api) {}
+  HiprtcProgram(const HiprtcProgram&) = delete;
+  HiprtcProgram& operator=(const HiprtcProgram&) = delete;
+
+  hiprtcProgram* address() noexcept { return &program_; }
+  hiprtcProgram get() const noexcept { return program_; }
+
+  // Relinquish ownership before the runtime call so error cleanup cannot destroy a handle twice.
+  void reset() noexcept {
+    if (!program_)
+      return;
+    hiprtcProgram program = program_;
+    program_ = nullptr;
+    (void)api_.destroy_program(&program);
+  }
+
+  ~HiprtcProgram() {
+    reset();
+  }
+};
+
+} // namespace mom

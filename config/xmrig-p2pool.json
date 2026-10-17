@@ -1,0 +1,43 @@
+{
+    "_comment": "PS5 one-thread light-mode P2Pool test; payout wallet is configured on P2Pool.",
+    "autosave": false,
+    "background": false,
+    "colors": false,
+    "log-file": "/data/xmrig-p2pool.log",
+    "syslog": false,
+    "watch": false,
+    "randomx": {
+        "init": 1,
+        "mode": "light",
+        "rdmsr": false,
+        "wrmsr": false,
+        "numa": false
+    },
+    "cpu": {
+        "enabled": true,
+        "huge-pages": false,
+        "huge-pages-jit": false,
+        "hw-aes": false,
+        "asm": false,
+        "rx": [
+            -1
+        ]
+    },
+    "pools": [
+        {
+            "algo": "rx/0",
+            "url": "127.0.0.1:3333",
+            "user": "x",
+            "pass": "ps5-test",
+            "tls": false,
+            "keepalive": true
+        }
+    ],
+    "print-time": 10,
+    "http": {
+        "enabled": true,
+        "host": "0.0.0.0",
+        "port": 18088,
+        "restricted": true
+    }
+}

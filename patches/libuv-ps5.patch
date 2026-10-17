@@ -1,0 +1,88 @@
+diff --git a/src/unix/bsd-proctitle.c b/src/unix/bsd-proctitle.c
+index b0c01e2..3918b86 100644
+--- a/src/unix/bsd-proctitle.c
++++ b/src/unix/bsd-proctitle.c
+@@ -61,7 +61,10 @@ int uv_set_process_title(const char* title) {
+ 
+   uv__free(process_title);
+   process_title = new_title;
++/* Keep libuv's cached title; the PS5 does not export setproctitle. */
++#if !defined(__PROSPERO__)
+   setproctitle("%s", title);
++#endif
+ 
+   uv_mutex_unlock(&process_title_mutex);
+ 
+diff --git a/src/unix/core.c b/src/unix/core.c
+index 965e7f7..07bf5b5 100644
+--- a/src/unix/core.c
++++ b/src/unix/core.c
+@@ -75,7 +75,10 @@ extern char** environ;
+ # include <sys/param.h>
+ # if defined(__FreeBSD__)
+ #  include <sys/cpuset.h>
++#  if !defined(__PROSPERO__)
++/* PS5 uses libuv's accept + fcntl fallback. */
+ #  define uv__accept4 accept4
++#  endif
+ # endif
+ # if defined(__NetBSD__)
+ #  define uv__accept4(a, b, c, d) paccept((a), (b), (c), NULL, (d))
+@@ -640,6 +643,10 @@ int uv__close(int fd) {
+ 
+ #if UV__NONBLOCK_IS_IOCTL
+ int uv__nonblock_ioctl(int fd, int set) {
++#if defined(UV_PS5_NATIVE_APP)
++  /* Native sockets support fcntl nonblocking; FIONBIO is payload-specific. */
++  return uv__nonblock_fcntl(fd, set);
++#else
+   int r;
+ 
+   do
+@@ -650,6 +657,7 @@ int uv__nonblock_ioctl(int fd, int set) {
+     return UV__ERR(errno);
+ 
+   return 0;
++#endif
+ }
+ #endif
+ 
+@@ -697,6 +705,11 @@ int uv__cloexec(int fd, int set) {
+     r = fcntl(fd, F_SETFD, flags);
+   while (r == -1 && errno == EINTR);
+ 
++#if defined(UV_PS5_NATIVE_APP)
++  /* Native title never execs children; EINVAL means FD_CLOEXEC is unsupported. */
++  if (r == -1 && errno == EINVAL)
++    return 0;
++#endif
+   if (r)
+     return UV__ERR(errno);
+ 
+@@ -1086,7 +1099,8 @@ int uv__slurp(const char* filename, char* buf, size_t len) {
+ 
+ 
+ int uv__dup2_cloexec(int oldfd, int newfd) {
+-#if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__linux__)
++/* PS5 exports dup2; use the existing close-on-exec fallback. */
++#if (defined(__FreeBSD__) && !defined(__PROSPERO__)) || defined(__NetBSD__) || defined(__linux__)
+   int r;
+ 
+   r = dup3(oldfd, newfd, O_CLOEXEC);
+diff --git a/src/unix/tty.c b/src/unix/tty.c
+index d099bdb..6874817 100644
+--- a/src/unix/tty.c
++++ b/src/unix/tty.c
+@@ -179,9 +179,12 @@ int uv_tty_init(uv_loop_t* loop, uv_tty_t* tty, int fd, int unused) {
+      * master/slave pair (Linux). Therefore check if the fd points to a
+      * slave device.
+      */
++/* Payload logging does not reopen terminal devices on PS5. */
++#if !defined(__PROSPERO__)
+     if (uv__tty_is_slave(fd) && ttyname_r(fd, path, sizeof(path)) == 0)
+       r = uv__open_cloexec(path, mode | O_NOCTTY);
+     else
++#endif
+       r = -1;
+ 
+     if (r < 0) {

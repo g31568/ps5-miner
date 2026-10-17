@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// C29 SipHash logic adapted from MoneroOcean's SYCL miner (2025-2026).
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer Output { uvec2 edges[]; } outputData;
+layout(push_constant, std430) uniform Parameters {
+  uvec2 seed[4];
+  uint firstNonce;
+  uint edgeCount;
+  uint outputOffset;
+} params;
+
+#extension GL_GOOGLE_include_directive : require
+#include "siphash.glsl"
+
+// One invocation walks a complete stateful block, even for a partial output range.
+void main() {
+  uint firstBlock = params.firstNonce >> 6;
+  uint block = firstBlock + gl_GlobalInvocationID.x;
+  uint endNonce = params.firstNonce + params.edgeCount;
+  if (params.edgeCount == 0 || block >= ((endNonce + 63) >> 6)) return;
+  uvec2 a = params.seed[0], b = params.seed[1];
+  uvec2 c = params.seed[2], d = params.seed[3];
+  uvec2 hashes[64];
+  for (uint i = 0; i < 64; ++i) {
+    uvec2 nonce = uvec2(block * 64 + i, 0);
+    d ^= nonce;
+    sipRound(a, b, c, d);
+    sipRound(a, b, c, d);
+    a ^= nonce;
+    c ^= uvec2(255, 0);
+    sipRound(a, b, c, d);
+    sipRound(a, b, c, d);
+    sipRound(a, b, c, d);
+    sipRound(a, b, c, d);
+    hashes[i] = a ^ b ^ c ^ d;
+  }
+  for (uint i = 0; i < 64; ++i) {
+    uint nonce = block * 64 + i;
+    if (nonce < params.firstNonce || nonce >= endNonce) continue;
+    // The last word is used directly; only the other 63 words XOR with it.
+    uvec2 edge = i == 63 ? hashes[63] : hashes[i] ^ hashes[63];
+    outputData.edges[params.outputOffset + nonce - params.firstNonce] = edge & uvec2(0x1fffffff);
+  }
+}

@@ -1,0 +1,231 @@
+class FishState {
+public:
+  sycl::device device;
+  sycl::queue queue;
+  bool shared_io;
+  uint8_t* input = nullptr;
+  uint8_t* target = nullptr;
+  uint64_t* cache = nullptr;
+  uint64_t* dag = nullptr;
+  FishResult* result = nullptr;
+  unsigned input_cap = 0;
+  unsigned coop_workgroup;
+  bool cache_built = false;
+  bool dag_built = false;
+  int karlsen_cooperative = -1;
+  std::mutex mutex;
+  // Bind the fixed dataset and job buffers to a device with required USM support.
+  explicit FishState(const std::string& dev_str)
+      : device(get_dev(dev_str)),
+        queue(device, sycl::property_list{sycl::property::queue::in_order{}}),
+        shared_io(device.is_cpu() || !mom_has_usm_device(device)),
+        coop_workgroup(cooperative_workgroup(device)) {
+    if (!mom_has_usm_shared(device) || (!device.is_cpu() && !mom_has_usm_device(device)))
+      throw std::string("fishhash SYCL device does not support required allocations");
+  }
+  static unsigned cooperative_workgroup(const sycl::device& dev) {
+    // Both CUDA compiler paths peak at 512 on the RTX 5060 Ti (3.2% over 128 for AdaptiveCpp and
+    // 5.1% for DPC++); wide pre-sm80 CUDA peaks at 256 (V100S: +2.7%). Intel and AMD are
+    // flat-to-slower above 128. Clamp against the device limit.
+    unsigned preferred = mom_is_cuda(dev) ? 512 : 128;
+#if defined(MOM_SYCL_ADAPTIVECPP_CUDA)
+    if (mom_is_cuda(dev) && dev.get_info<sycl::info::device::max_compute_units>() >= 64)
+      preferred = 256;
+#endif
+    const unsigned fallback = sycl_default_workgroup(dev, {64, 128, 256, 512}, preferred);
+    unsigned long parsed = 0;
+    if (!mom_parse_env_ulong("MOM_FISHHASH_WORKGROUP", parsed))
+      return fallback;
+    for (const unsigned candidate : {64u, 128u, 256u, 512u})
+      if (parsed == candidate && sycl_workgroup_fits(dev, candidate))
+        return candidate;
+    return fallback;
+  }
+  // Drain kernels before releasing cache, DAG, and job buffers.
+  ~FishState() {
+    sycl_cleanup_noexcept("fishhash wait", [&] { queue.wait_and_throw(); });
+    sycl_cleanup_noexcept("fishhash release", [&] { free_all(); });
+  }
+  template <typename T> T* alloc(size_t n) {
+    return shared_io ? sycl::malloc_shared<T>(n, queue) : sycl::malloc_device<T>(n, queue);
+  }
+  void free_ptr(auto*& p) {
+    if (p)
+      sycl::free(p, queue);
+    p = nullptr;
+  }
+  void free_all() {
+    free_ptr(input);
+    free_ptr(target);
+    free_ptr(cache);
+    free_ptr(dag);
+    free_ptr(result);
+  }
+  // Grow header buffers after queue completion, retaining production-header capacity.
+  void ensure_io(unsigned in_sz) {
+    if (input && in_sz <= input_cap && target && result)
+      return;
+    queue.wait_and_throw();
+    free_ptr(input);
+    free_ptr(target);
+    free_ptr(result);
+    input_cap = 0;
+    try {
+      const unsigned requested_cap = in_sz < 180 ? 180 : in_sz;
+      input = alloc<uint8_t>(requested_cap);
+      target = alloc<uint8_t>(HASH_LEN);
+      result = sycl::malloc_shared<FishResult>(1, queue);
+      if (!input || !target || !result)
+        throw std::string("Can't allocate fishhash buffers");
+      std::memset(result, 0, sizeof(*result));
+      input_cap = requested_cap;
+    } catch (...) {
+      free_ptr(input);
+      free_ptr(target);
+      free_ptr(result);
+      input_cap = 0;
+      throw;
+    }
+  }
+  // Build/upload the cache once; failures never publish cache_built.
+  void ensure_cache(bool log) {
+    if (cache_built)
+      return;
+    const uint64_t t0 = now_ms();
+    cache_built = false;
+    try {
+      free_ptr(cache);
+      std::vector<uint64_t> hcache;
+      build_light_cache_host(hcache);
+      cache = alloc<uint64_t>(hcache.size());
+      if (!cache)
+        throw std::string("Can't allocate fishhash light cache");
+      if (shared_io)
+        std::memcpy(cache, hcache.data(), hcache.size() * sizeof(uint64_t));
+      else
+        sycl_wait_and_throw(queue.memcpy(cache, hcache.data(), hcache.size() * sizeof(uint64_t)),
+                            device);
+      cache_built = true;
+      if (log)
+        std::fprintf(stderr, "FishHash light cache (72 MiB) built (%llu ms)\n",
+                     (unsigned long long)(now_ms() - t0));
+    } catch (...) {
+      free_ptr(cache);
+      cache_built = false;
+      throw;
+    }
+  }
+  // Build watchdog-bounded chunks and publish dag_built only after every slice completes.
+  void ensure_dag(bool log) {
+    if (dag_built)
+      return;
+    const uint64_t t0 = now_ms();
+    dag_built = false;
+    try {
+      ensure_cache(log);
+      free_ptr(dag); // release a partial buffer from a previously-failed attempt before re-allocating
+      dag = alloc<uint64_t>((size_t)FULL_DATASET_NUM_ITEMS * 16); // 4.6 GiB
+      if (!dag)
+        throw std::string("Can't allocate fishhash DAG (4.6 GiB)");
+      const uint32_t CHUNK = 1u << 21; // 2M items/launch to avoid the GPU watchdog
+      for (uint32_t s = 0; s < (uint32_t)FULL_DATASET_NUM_ITEMS; s += CHUNK) {
+        const uint32_t c = std::min(CHUNK, (uint32_t)FULL_DATASET_NUM_ITEMS - s);
+        sycl_wait_and_throw(submit_fishhash_dag_gen(queue, cache, dag, s, c), device);
+      }
+      dag_built = true;
+      if (log)
+        std::fprintf(stderr, "FishHash DAG (4.6 GiB) built (%llu ms)\n",
+                     (unsigned long long)(now_ms() - t0));
+    } catch (...) {
+      free_ptr(dag);
+      dag_built = false;
+      throw;
+    }
+  }
+  static uint64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+};
+
+// Keep the registry shell alive across static teardown; ordered cleanup releases its values.
+static DeviceStateRegistry<FishState>& fishhash_registry() {
+  static auto* const registry = new DeviceStateRegistry<FishState>;
+  return *registry;
+}
+
+static FishState& fishhash_state(const std::string& dev_str) {
+  return fishhash_registry().get(dev_str, [&] { return std::make_unique<FishState>(dev_str); });
+}
+
+// Cache backend search policy, timing both real kernels on Level Zero.
+static bool select_karlsen_cooperative(FishState& state, const unsigned input_size,
+                                       const uint64_t start_nonce) {
+#if defined(MOM_SYCL_PORTABLE_OPENCL)
+  (void)state;
+  (void)input_size;
+  (void)start_nonce;
+  return false;
+#else
+  if (state.karlsen_cooperative >= 0)
+    return state.karlsen_cooperative != 0;
+
+  // CUDA and HIP have a clear cooperative winner. Generic OpenCL retains the portable scalar path;
+  // Level Zero is tuned because Arc generations differ substantially in register pressure versus
+  // subgroup-exchange cost. This measures the common kernels instead of branching on a GPU model.
+  if (mom_is_cuda(state.device) || mom_is_hip(state.device)) {
+    state.karlsen_cooperative = 1;
+    return true;
+  }
+  if (!sycl_is_level_zero_gpu(state.device)) {
+    state.karlsen_cooperative = 0;
+    return false;
+  }
+  const auto subgroup_sizes = state.device.get_info<sycl::info::device::sub_group_sizes>();
+  if (std::find(subgroup_sizes.begin(), subgroup_sizes.end(), FISH_TEAM) == subgroup_sizes.end()) {
+    state.karlsen_cooperative = 0;
+    return false;
+  }
+
+  constexpr uint32_t warmup_intensity = 65536;
+  constexpr uint32_t sample_intensity = 1048576;
+  const auto run = [&](const bool cooperative, const uint32_t count) {
+    std::memset(state.result, 0, sizeof(*state.result));
+    const auto begin = std::chrono::steady_clock::now();
+    const sycl::event event =
+        cooperative
+            ? submit_karlsenhashv2_search_coop(state.queue, state.input, input_size, start_nonce,
+                                               state.dag, count, state.target, state.result, false,
+                                               state.coop_workgroup)
+            : submit_karlsenhashv2_search<true>(state.queue, state.input, input_size, start_nonce,
+                                                nullptr, state.dag, count, state.target, state.result,
+                                                false);
+    sycl_wait_and_throw(event, state.device);
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+  };
+
+  // Exclude each kernel's first-launch JIT cost, then alternate order to avoid a clock/thermal bias.
+  run(false, warmup_intensity);
+  run(true, warmup_intensity);
+  double scalar_seconds = run(false, sample_intensity);
+  double cooperative_seconds = run(true, sample_intensity);
+  cooperative_seconds += run(true, sample_intensity);
+  scalar_seconds += run(false, sample_intensity);
+  state.karlsen_cooperative = cooperative_seconds < scalar_seconds ? 1 : 0;
+  const double hashes = 2.0 * sample_intensity / 1e6;
+  std::fprintf(stderr, "karlsenhashv2: selected %s search (scalar %.2f, cooperative %.2f MH/s)\n",
+               state.karlsen_cooperative ? "cooperative" : "scalar", hashes / scalar_seconds,
+               hashes / cooperative_seconds);
+  return state.karlsen_cooperative != 0;
+#endif
+}
+
+// Release device state before the compiler runtime unloads without escaping exceptions.
+void fishhash_cleanup_states() noexcept {
+  try {
+    fishhash_registry().clear();
+  } catch (...) {
+    std::fprintf(stderr, "fishhash: ordered SYCL cleanup failed\n");
+  }
+}
