@@ -34,7 +34,7 @@ with zipfile.ZipFile(binary) as archive:
         raise SystemExit('Release ZIP failed integrity verification')
 source = out/(stem+'-source.tar.gz')
 # An explicit source allowlist excludes symlinks, private logs, SDK caches and databases.
-entries = ['README.md', 'BUILDING.md', 'THIRD_PARTY.md', 'LICENSE', 'VALIDATION.md',
+entries = ['README.md', 'BUILDING.md', 'THIRD_PARTY.md', 'LICENSE', 'VALIDATION.md', 'benchmark.md',
            '.gitignore', '.github', 'docs', 'licenses', 'SECURITY.md', 'homebrew', 'ps5', 'sycl', 'xmrig', 'config', 'patches', 'scripts', 'payload', 'tests']
 def public_owner(info):
     # Keep the build host's account identity out of source archive metadata.
